@@ -1,0 +1,1812 @@
+"""
+ATHARVIAN THESISFORGE LAB™ — Mark 35 · Streamlit Edition  (single file)
+=======================================================================
+
+Everything lives in this one file: the app, the Google Drive token helper,
+and the requirements list (see the "Setup Guide" page inside the app).
+
+Run the app:
+    pip install streamlit openai python-docx scikit-learn pandas google-api-python-client google-auth
+    streamlit run app.py
+
+One-time Google Drive login (run on your own computer):
+    pip install google-auth-oauthlib
+    python app.py --get-drive-token
+
+Streamlit secrets (.streamlit/secrets.toml, or the Cloud "Secrets" box):
+
+    OPENROUTER_API_KEY = "sk-or-..."
+    SecurityPasscode   = "your-training-passcode"
+    OPENROUTER_MODEL   = "nvidia/nemotron-3-super-120b-a12b:free"   # optional
+
+    [gdrive]
+    client_id         = "....apps.googleusercontent.com"
+    client_secret     = "GOCSPX-..."
+    refresh_token     = "1//..."
+    root_folder       = "ThesisForge Lab"   # optional (default shown)
+    brainstorm_folder = "BrainstormAI"      # optional (default shown)
+
+Without a [gdrive] section the app still works and keeps files on the app server.
+"""
+
+import copy
+import hmac
+import io
+import json
+import os
+import random
+import re
+import sys
+import time
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+from docx import Document
+from openai import OpenAI
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import SGDClassifier
+
+try:
+    from google.auth.exceptions import RefreshError
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+    from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+
+    DRIVE_LIBS_OK = True
+except ImportError:  # the app keeps working with local storage only
+    DRIVE_LIBS_OK = False
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+APP_NAME = "ThesisForge Lab™"
+VERSION = "Mark 35 · Streamlit Edition"
+DEFAULT_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+BRAINSTORM_URL = (
+    "https://colab.research.google.com/drive/"
+    "10QOcIFrAh81a4wZWFU185683rPyGp0hd?usp=sharing"
+)
+
+def _in_streamlit():
+    try:
+        from streamlit.runtime import exists
+
+        return exists()
+    except Exception:
+        return False
+
+
+def run_drive_token_helper():
+    """One-time helper:  python app.py --get-drive-token   (run on your own computer)."""
+    try:
+        from google_auth_oauthlib.flow import InstalledAppFlow
+    except ImportError:
+        sys.exit("Install the helper first:  pip install google-auth-oauthlib")
+
+    if not os.path.exists("client_secret.json"):
+        sys.exit(
+            "client_secret.json was not found next to app.py.\n"
+            "Google Cloud Console -> APIs & Services -> Credentials -> Create credentials ->\n"
+            "OAuth client ID -> Desktop app -> Download JSON, then save it as client_secret.json."
+        )
+
+    flow = InstalledAppFlow.from_client_secrets_file(
+        "client_secret.json", ["https://www.googleapis.com/auth/drive"]
+    )
+    # access_type=offline + prompt=consent guarantees a refresh token is returned.
+    creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
+    if not creds.refresh_token:
+        sys.exit(
+            "Google did not return a refresh token. Remove the app's access at "
+            "https://myaccount.google.com/permissions and run this again."
+        )
+
+    print("\n" + "=" * 60)
+    print("Paste this into your Streamlit secrets (keep it private):")
+    print("=" * 60)
+    print("[gdrive]")
+    print(f'client_id     = "{creds.client_id}"')
+    print(f'client_secret = "{creds.client_secret}"')
+    print(f'refresh_token = "{creds.refresh_token}"')
+    print("=" * 60)
+
+
+if __name__ == "__main__" and not _in_streamlit():
+    if "--get-drive-token" in sys.argv:
+        run_drive_token_helper()
+    else:
+        print(
+            "This is a Streamlit app. Start it with:\n"
+            "    streamlit run app.py\n\n"
+            "One-time Google Drive login:\n"
+            "    python app.py --get-drive-token"
+        )
+    sys.exit(0)
+
+st.set_page_config(page_title=APP_NAME, page_icon="🔬", layout="wide")
+
+# Local storage (replaces Google Drive). Override with THESISFORGE_DATA_DIR.
+DATA_DIR = Path(os.environ.get("THESISFORGE_DATA_DIR", "thesisforge_data"))
+THESIS_DIR = DATA_DIR / "Theses"
+TRAINING_DATA_PATH = DATA_DIR / "training_data.json"
+TRAINING_FILENAME = "training_data.json"
+THESIS_DIR.mkdir(parents=True, exist_ok=True)
+
+BRANCHES = ["biology", "chemistry", "physics"]
+
+REQUIREMENTS_TXT = """streamlit
+openai
+python-docx
+scikit-learn
+pandas
+google-api-python-client
+google-auth
+"""
+
+SECRETS_TEMPLATE = """OPENROUTER_API_KEY = "sk-or-..."
+SecurityPasscode   = "your-training-passcode"
+OPENROUTER_MODEL   = "nvidia/nemotron-3-super-120b-a12b:free"   # optional
+
+[gdrive]
+client_id         = "....apps.googleusercontent.com"
+client_secret     = "GOCSPX-..."
+refresh_token     = "1//..."
+root_folder       = "ThesisForge Lab"   # optional
+brainstorm_folder = "BrainstormAI"      # optional
+"""
+
+WORKFLOW_DIAGRAM = """AI generates batch
+        ↓
+Print entire batch
+        ↓
+Dhruv reviews it
+        ↓
+┌───────────────┬────────────────┐
+│               │                │
+REJECT        ACCEPT ALL       SELECTIVE
+│               │                │
+discard       save/use        untick the rows
+                              you don't want,
+                              then add the rest"""
+
+SECTION_KEYS = [
+    "abstract",
+    "introduction",
+    "literature review",
+    "theoretical framework",
+    "methodology",
+    "results",
+    "discussion",
+    "conclusion",
+    "references",
+    "appendices",
+]
+
+SECTION_LABELS = {
+    "abstract": "Abstract",
+    "introduction": "Introduction",
+    "literature review": "Literature Review",
+    "theoretical framework": "Theoretical Framework",
+    "methodology": "Methodology",
+    "results": "Results / Findings",
+    "discussion": "Discussion",
+    "conclusion": "Conclusion",
+    "references": "References",
+    "appendices": "Appendices",
+}
+
+GREETINGS = [
+    "Hello, researcher! ThesisBot is online and ready to investigate.",
+    "Welcome back, scientist. Let's turn that idea into a research project.",
+    "Greetings, researcher! Your thesis laboratory is now open.",
+    "Hello! ThesisBot reporting for research duty.",
+    "Welcome to Atharvian ThesisForge Lab. Time to build something worth questioning.",
+    "Research mode activated. Let's examine your idea carefully.",
+    "Hello, scientist! Hypotheses ready? Let's forge some research.",
+    "ThesisBot online. Let's explore, challenge, improve, and document.",
+    "Welcome, researcher! The laboratory is open.",
+    "Hello, scientist! What are we investigating today?",
+    "ThesisBot is awake and ready for another experiment in ideas.",
+    "Greetings! Let's transform curiosity into research.",
+    "Research session initiated. Let's begin.",
+    "Hello, explorer of knowledge!",
+    "Welcome back! Your research journey continues.",
+    "Scientist detected. ThesisBot standing by.",
+    "Hello! Let's turn questions into evidence.",
+    "Welcome to another session of scientific discovery.",
+    "ThesisBot reporting: all systems ready.",
+    "Greetings, investigator! What mystery shall we examine?",
+    "Hello, researcher! Let's sharpen that scientific thinking.",
+    "Welcome! Your next research breakthrough might begin here.",
+    "Research engines warming up.",
+    "Hello, scholar! Let's forge some knowledge.",
+    "ThesisBot is ready to challenge assumptions.",
+    "Welcome, investigator. Let's examine the evidence.",
+    "Hello! Time to question, analyze, and discover.",
+    "Your research laboratory is officially open.",
+    "Greetings, scientist! Let's make today's questions count.",
+    "ThesisBot online. Curiosity levels: maximum.",
+    "Hello, researcher! Let's build something scientifically interesting.",
+    "Welcome back to the research desk.",
+    "Research mode: activated.",
+    "Hello! Let's investigate the unknown.",
+    "Greetings! Another thesis adventure begins.",
+    "Welcome, scientist. Let's separate facts from assumptions.",
+    "ThesisBot ready for intellectual heavy lifting.",
+    "Hello, researcher! Bring on the difficult questions.",
+    "Welcome! Let's turn an idea into a structured investigation.",
+    "Scientific thinking engaged.",
+    "ThesisBot reporting for another mission.",
+    "Hello! Let's make your research clearer and stronger.",
+    "Welcome back, explorer of ideas.",
+    "Greetings! Today we forge knowledge.",
+    "Research assistant online and standing by.",
+    "Hello, scientist! Let's examine your hypothesis.",
+    "Welcome to the ThesisForge Lab research chamber.",
+    "ThesisBot is ready. What's our next investigation?",
+    "Hello! Let's test ideas instead of simply believing them.",
+    "Greetings, researcher. Evidence awaits.",
+    "Welcome! Time to investigate with curiosity and caution.",
+    "Scientific reasoning mode engaged.",
+    "Hello, scholar! Let's organize those ideas.",
+    "ThesisBot ready to analyze.",
+    "Welcome back! Let's improve the research one section at a time.",
+    "Greetings, scientist! Let's make the unknown a little less unknown.",
+    "Hello, researcher! Your next question matters.",
+    "Research laboratory initialized.",
+    "Welcome! Let's explore a fresh scientific idea.",
+    "ThesisBot online and prepared for analysis.",
+    "Hello, investigator! Let's see what the evidence tells us.",
+    "Greetings! Let's forge a stronger research project.",
+    "Welcome back to ThesisForge Lab.",
+    "Scientific curiosity detected.",
+    "Hello! Ready to investigate something interesting?",
+    "ThesisBot reporting from the research desk.",
+    "Welcome, researcher! Let's challenge weak assumptions.",
+    "Greetings, scientist. Let's turn curiosity into structured inquiry.",
+    "Hello! Another research mission begins.",
+    "Research systems activated.",
+    "Welcome! Let's make today's investigation count.",
+    "ThesisBot ready for questions, hypotheses, and discoveries.",
+    "Hello, scholar! Let's explore your research question.",
+    "Greetings! Bring your toughest research problem.",
+    "Welcome back, scientist. Let's continue the investigation.",
+    "Research mode is fully engaged.",
+    "Hello! Let's build a thesis worth reading.",
+    "ThesisBot online. Scientific thinking encouraged.",
+    "Welcome, researcher! Let's examine what we know—and what we don't.",
+    "Greetings! Let's turn complexity into clarity.",
+    "Hello, investigator. The evidence awaits.",
+    "Research mission launched.",
+    "Welcome to another session of careful reasoning.",
+    "ThesisBot is ready to help you investigate.",
+    "Hello, scientist! Let's explore the possibilities.",
+    "Greetings, researcher! Let's structure those ideas.",
+    "Welcome back! Another scientific problem awaits.",
+    "Research engines fully powered.",
+    "Hello! Let's question the obvious.",
+    "ThesisBot ready for another intellectual adventure.",
+    "Welcome, scholar. Let's make your research more precise.",
+    "Greetings! Time to investigate, compare, and conclude.",
+    "Hello, researcher! Let's strengthen your argument.",
+    "Research session started.",
+    "Welcome back to your scientific workspace.",
+    "ThesisBot is ready for analysis and discovery.",
+    "Hello! Let's make evidence our guide.",
+    "Greetings, investigator! Let's explore the research frontier.",
+    "Welcome, scientist. Let's ask better questions.",
+    "Research mode activated—curiosity recommended.",
+    "Hello, scholar! Let's begin the investigation.",
+    "ThesisBot online. Let's forge something useful.",
+    "Welcome, researcher! Let's turn uncertainty into investigation.",
+    "Greetings! Another chapter of scientific exploration begins.",
+    "Hello! Let's investigate before we conclude.",
+    "Research laboratory ready for operation.",
+    "Welcome back, scientist. Let's get to work.",
+]
+
+TIPS = [
+    "Tip: A hypothesis is a proposed explanation; experimental evidence is what tests it.",
+    "Tip: Define important terms clearly so another researcher can understand your work.",
+    "Tip: A strong research question is specific enough to investigate and broad enough to matter.",
+    "Tip: Distinguish established evidence from your own proposed model.",
+    "Tip: Keep references organized while researching instead of trying to reconstruct them later.",
+    "Tip: Results describe what happened; discussion explains what those results may mean.",
+    "Tip: A surprising result is not automatically a bad result. Sometimes it is the interesting part.",
+    "Tip: Good scientific writing makes uncertainty visible instead of hiding it.",
+    "Tip: Start with a clear research question before collecting information.",
+    "Tip: A precise title makes the purpose of a study easier to understand.",
+    "Tip: Avoid making claims stronger than the evidence supports.",
+    "Tip: Separate observations from interpretations.",
+    "Tip: Use reliable sources whenever possible.",
+    "Tip: Compare multiple sources before accepting an important claim.",
+    "Tip: Keep track of where each important fact came from.",
+    "Tip: A research paper should have a logical flow from question to conclusion.",
+    "Tip: Your introduction should explain why the topic matters.",
+    "Tip: The literature review shows what researchers already know.",
+    "Tip: Theoretical frameworks help explain how ideas are connected.",
+    "Tip: Methodology should explain how the investigation was carried out.",
+    "Tip: Results should present findings clearly and honestly.",
+    "Tip: Discussion should connect results back to the research question.",
+    "Tip: Conclusions should be supported by the findings.",
+    "Tip: Do not confuse correlation with causation.",
+    "Tip: A larger sample is not automatically a better sample.",
+    "Tip: Reproducibility is an important part of good science.",
+    "Tip: Record important decisions made during the research process.",
+    "Tip: Define variables before interpreting their relationships.",
+    "Tip: Control important variables when designing an experiment.",
+    "Tip: Random variation can affect experimental results.",
+    "Tip: Measurement error can influence conclusions.",
+    "Tip: Repeating an experiment can reveal whether a result is consistent.",
+    "Tip: A result that disagrees with your prediction can still be valuable.",
+    "Tip: Scientific models are useful representations, not perfect copies of reality.",
+    "Tip: Explain assumptions behind your proposed model.",
+    "Tip: Use examples to make complicated ideas easier to understand.",
+    "Tip: Avoid unnecessary jargon when a simpler explanation works.",
+    "Tip: A strong paragraph usually has one main idea.",
+    "Tip: Evidence should appear close to the claim it supports.",
+    "Tip: Clear headings make long research documents easier to navigate.",
+    "Tip: Read your own work as if you were a skeptical reviewer.",
+    "Tip: Ask yourself what evidence could prove your idea wrong.",
+    "Tip: Good science welcomes attempts to challenge its conclusions.",
+    "Tip: Distinguish a possibility from a probability.",
+    "Tip: Distinguish a prediction from an observation.",
+    "Tip: Use precise units when describing measurements.",
+    "Tip: Check calculations independently when possible.",
+    "Tip: Keep numerical values consistent throughout your paper.",
+    "Tip: Explain unusual results instead of silently ignoring them.",
+    "Tip: Avoid cherry-picking results that support your preferred conclusion.",
+    "Tip: Negative results can still answer meaningful research questions.",
+    "Tip: A limitation is not necessarily a failure; it explains the boundaries of your study.",
+    "Tip: State important limitations honestly.",
+    "Tip: Think about alternative explanations for your results.",
+    "Tip: Use graphs when they communicate patterns better than paragraphs.",
+    "Tip: Label graphs and tables clearly.",
+    "Tip: Tables should make information easier, not harder, to interpret.",
+    "Tip: Keep terminology consistent throughout the thesis.",
+    "Tip: Check that every major section supports the central research question.",
+    "Tip: Remove repetition that does not add new information.",
+    "Tip: Strong conclusions summarize rather than introduce unrelated ideas.",
+    "Tip: Read your title again after finishing the paper; your research may have evolved.",
+    "Tip: Search for contradictory evidence, not only supporting evidence.",
+    "Tip: Independent verification increases confidence in important findings.",
+    "Tip: Distinguish primary sources from summaries when appropriate.",
+    "Tip: Historical scientific claims should be checked against reliable sources.",
+    "Tip: When using statistics, understand what the numbers actually measure.",
+    "Tip: A percentage without context can be misleading.",
+    "Tip: Always check the units before comparing measurements.",
+    "Tip: Scientific terminology can have very specific meanings.",
+    "Tip: Define unfamiliar terminology before using it repeatedly.",
+    "Tip: A good abstract should summarize the whole study rather than tease the reader.",
+    "Tip: The abstract is often easier to write after the main research is complete.",
+    "Tip: Your research question should guide your methodology.",
+    "Tip: Your methodology should allow someone else to understand what you did.",
+    "Tip: Keep an audit trail of important research decisions.",
+    "Tip: Use consistent citation formatting.",
+    "Tip: Verify references before submitting your work.",
+    "Tip: Never invent a source just to make a bibliography look complete.",
+    "Tip: Clearly mark speculation as speculation.",
+    "Tip: Proposed theories require evidence before they can be treated as established explanations.",
+    "Tip: A fascinating idea becomes stronger when you explain how it could be tested.",
+    "Tip: Think about what observation would support your hypothesis.",
+    "Tip: Also think about what observation would weaken your hypothesis.",
+    "Tip: Strong researchers are willing to revise their ideas.",
+    "Tip: Changing a hypothesis after new evidence appears is part of science.",
+    "Tip: Keep the research question manageable.",
+    "Tip: Narrowing a topic can make a study much stronger.",
+    "Tip: Avoid trying to answer ten unrelated questions in one thesis.",
+    "Tip: Organize your notes before writing the final sections.",
+    "Tip: Highlight evidence that directly answers your research question.",
+    "Tip: Distinguish expert consensus from a single unusual claim.",
+    "Tip: A source being popular does not automatically make it reliable.",
+    "Tip: Check dates when using rapidly changing scientific information.",
+    "Tip: Use caution when interpreting preliminary research.",
+    "Tip: Science progresses through testing, criticism, and refinement.",
+    "Tip: Ask whether your conclusion would still make sense if one assumption changed.",
+    "Tip: Look for hidden assumptions in your reasoning.",
+    "Tip: Try explaining your research to someone unfamiliar with the subject.",
+    "Tip: If you cannot explain an idea simply, investigate whether you fully understand it.",
+    "Tip: Good research balances creativity with evidence.",
+    "Tip: Creativity can generate hypotheses; evidence helps evaluate them.",
+    "Tip: Keep an open mind without abandoning critical thinking.",
+    "Tip: Unexpected findings can lead to better research questions.",
+    "Tip: Treat uncertainty as information, not embarrassment.",
+    "Tip: A strong thesis does not need to sound complicated to be scientifically valuable.",
+    "Tip: Before finalizing a paper, check every major claim against its evidence.",
+    "Tip: Proofread once for grammar and once separately for scientific accuracy.",
+    "Tip: Ask whether every section of the thesis earns its place.",
+    "Tip: The goal of research is not merely to sound impressive—it is to learn something.",
+]
+
+# ============================================================
+# CLASSGROOT DEFAULT TRAINING DATA
+# ============================================================
+
+DEFAULT_TOPICS = [
+    # Biology
+    "photosynthesis in plants", "human digestive system", "DNA replication",
+    "cell division", "human respiratory system", "structure of animal cells",
+    "structure of plant cells", "genetics and heredity", "human circulatory system",
+    "function of red blood cells", "human nervous system", "immune system and antibodies",
+    "reproduction in flowering plants", "ecosystems and food chains",
+    "evolution and natural selection", "bacterial growth", "protein synthesis in cells",
+    "plant transpiration", "human skeletal system", "effects of enzymes on digestion",
+    # Chemistry
+    "chemical reactions", "properties of acids and bases", "atomic structure",
+    "formation of compounds", "chemical bonding", "periodic table of elements",
+    "rates of chemical reactions", "oxidation and reduction", "properties of metals",
+    "properties of nonmetals", "ionic compounds", "covalent compounds",
+    "separation of chemical mixtures", "neutralization reactions", "combustion reactions",
+    "molecular structure of water", "electrolysis of water", "chemical equilibrium",
+    "solubility of salts", "laboratory identification of gases",
+    # Physics
+    "laws of motion", "gravity and planets", "electromagnetic waves",
+    "velocity and acceleration", "kinetic energy", "potential energy",
+    "motion of falling objects", "electric circuits", "magnetic fields",
+    "reflection of light", "refraction of light", "sound waves and frequency",
+    "heat transfer", "pressure in fluids", "work and mechanical energy",
+    "momentum and collisions", "simple machines", "nuclear radiation",
+    "motion of satellites", "properties of gravitational fields",
+]
+
+DEFAULT_LABELS = ["biology"] * 20 + ["chemistry"] * 20 + ["physics"] * 20
+
+# ============================================================
+# SMALL HELPERS
+# ============================================================
+
+
+def get_secret(name, default=None):
+    """Read from Streamlit secrets, falling back to environment variables."""
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.environ.get(name, default)
+
+
+def flash(kind, message):
+    """Show a message on the next run (survives st.rerun / callbacks)."""
+    st.session_state.flash = (kind, message)
+
+
+def show_flash():
+    item = st.session_state.pop("flash", None)
+    if item:
+        getattr(st, item[0])(item[1])
+
+
+def blank_sections():
+    return normalize_sections({})
+
+
+def normalize_sections(sections):
+    """Make older ThesisForge JSON files compatible with this version."""
+    defaults = {
+        "title": "",
+        "author": "",
+        "date": "",
+        "dominant_branch": "unknown",
+        **{key: "" for key in SECTION_KEYS},
+    }
+    for key, default in defaults.items():
+        if key not in sections or sections[key] is None:
+            sections[key] = default
+    return sections
+
+
+def safe_filename(title, suffix="", ext=".docx"):
+    name = re.sub(r'[<>:"/\\|?*]', "", title or "")
+    name = re.sub(r"\s+", " ", name).strip().replace(" ", "_")
+    return (name or "Research_Paper") + suffix + ext
+
+
+def format_brainpad(pad):
+    if isinstance(pad, (list, tuple)):
+        return "\n".join(f"- {item}" for item in pad)
+    if isinstance(pad, dict):
+        return json.dumps(pad, indent=2, ensure_ascii=False)
+    return str(pad)
+
+
+# ============================================================
+# AI (OPENROUTER)
+# ============================================================
+
+ERROR_TYPES = {
+    "usage_limit": ["quota", "rate limit", "resource exhausted", "429"],
+    "authentication": ["api key", "authentication", "unauthorized", "401"],
+    "network": ["connection", "network", "timeout"],
+    "server": ["500", "502", "503", "server error"],
+}
+
+ERROR_MESSAGES = {
+    "usage_limit": "AI usage limit reached. Please try again later.",
+    "authentication": "Authentication failed. Please check your OpenRouter API key in the Streamlit secrets.",
+    "network": "Network error. Please check your internet connection.",
+    "server": "The AI service is temporarily unavailable.",
+    "unknown": "An unexpected AI error occurred.",
+}
+
+
+def explain_ai_error(exception):
+    message = str(exception).lower()
+    for error_type, keywords in ERROR_TYPES.items():
+        if any(keyword in message for keyword in keywords):
+            return error_type
+    return "unknown"
+
+
+@st.cache_resource
+def get_client(api_key):
+    return OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+        default_headers={"X-Title": "Atharvian ThesisForge Lab"},
+    )
+
+
+def generate_ai_text(prompt):
+    """One shared function for every text-generation feature."""
+    api_key = get_secret("OPENROUTER_API_KEY")
+    if not api_key:
+        raise ValueError("OpenRouter API key is missing: add OPENROUTER_API_KEY to the Streamlit secrets.")
+
+    if st.session_state.get("use_brainpad") and st.session_state.get("brain_pad"):
+        prompt += "\n\nBrainstorming session:\n" + format_brainpad(st.session_state.brain_pad)
+
+    response = get_client(api_key).chat.completions.create(
+        model=get_secret("OPENROUTER_MODEL", DEFAULT_MODEL),
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7,
+    )
+    text = response.choices[0].message.content
+    if not text:
+        raise ValueError("The AI returned an empty response.")
+    return text.strip()
+
+
+def ask_ai(prompt, attempts=2):
+    """Call the AI with retries. Returns the text, or None after showing an error."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return generate_ai_text(prompt)
+        except Exception as exc:
+            error_type = explain_ai_error(exc)
+            if error_type in ("usage_limit", "authentication") or attempt == attempts:
+                st.error(ERROR_MESSAGES[error_type])
+                with st.expander("Technical details"):
+                    st.code(str(exc))
+                return None
+            time.sleep(1)
+    return None
+
+
+# ============================================================
+# GOOGLE DRIVE (personal OAuth — refresh token kept in Streamlit secrets)
+# ============================================================
+
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+FOLDER_MIME = "application/vnd.google-apps.folder"
+JSON_MIME = "application/json"
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def get_drive_config():
+    """The [gdrive] secrets as a dict, or None when Drive is not configured."""
+    if not DRIVE_LIBS_OK:
+        return None
+    try:
+        cfg = dict(st.secrets["gdrive"])
+    except Exception:
+        return None
+    if not all(cfg.get(k) for k in ("client_id", "client_secret", "refresh_token")):
+        return None
+    return cfg
+
+
+def drive_enabled():
+    return get_drive_config() is not None
+
+
+def drive_config_value(key, default):
+    return (get_drive_config() or {}).get(key) or default
+
+
+def drive_root_name():
+    return drive_config_value("root_folder", "ThesisForge Lab")
+
+
+def drive_service():
+    """One Drive client per browser session (the HTTP client is not thread-safe)."""
+    service = st.session_state.get("_drive_service")
+    if service is None:
+        cfg = get_drive_config()
+        creds = Credentials(
+            token=None,
+            refresh_token=cfg["refresh_token"],
+            token_uri="https://oauth2.googleapis.com/token",
+            client_id=cfg["client_id"],
+            client_secret=cfg["client_secret"],
+            scopes=DRIVE_SCOPES,
+        )
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        st.session_state["_drive_service"] = service
+    return service
+
+
+def drive_error(exc):
+    """Friendly text for any exception raised while talking to Drive."""
+    if DRIVE_LIBS_OK and isinstance(exc, RefreshError):
+        return (
+            "Google rejected the saved login (the refresh token expired or was revoked). "
+            "Create a new refresh token with get_drive_token.py and update the secrets."
+        )
+    if DRIVE_LIBS_OK and isinstance(exc, HttpError):
+        status = getattr(exc.resp, "status", "?")
+        return f"Google Drive error (HTTP {status}): {getattr(exc, 'reason', None) or exc}"
+    return str(exc)
+
+
+def _q(value):
+    """Escape a value for a Drive search query."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def drive_find(name, parent="root", folder=False):
+    query = f"name = '{_q(name)}' and '{parent}' in parents and trashed = false"
+    if folder:
+        query += f" and mimeType = '{FOLDER_MIME}'"
+    result = drive_service().files().list(
+        q=query,
+        spaces="drive",
+        fields="files(id, name, modifiedTime)",
+        orderBy="modifiedTime desc",
+        pageSize=10,
+    ).execute()
+    files = result.get("files", [])
+    return files[0] if files else None
+
+
+def drive_get_or_create_folder(name, parent="root"):
+    found = drive_find(name, parent, folder=True)
+    if found:
+        return found["id"]
+    created = drive_service().files().create(
+        body={"name": name, "mimeType": FOLDER_MIME, "parents": [parent]},
+        fields="id",
+    ).execute()
+    return created["id"]
+
+
+def drive_folders():
+    """IDs of  ThesisForge Lab / Theses / Exports  on Drive (created on first use)."""
+    ids = st.session_state.get("_drive_ids")
+    if not ids:
+        root = drive_get_or_create_folder(drive_root_name())
+        ids = {
+            "root": root,
+            "theses": drive_get_or_create_folder("Theses", root),
+            "exports": drive_get_or_create_folder("Exports", root),
+        }
+        st.session_state["_drive_ids"] = ids
+    return ids
+
+
+def drive_upload(name, data, mime, parent):
+    """Create the file, or overwrite the one with the same name in that folder."""
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
+    files = drive_service().files()
+    existing = drive_find(name, parent)
+    if existing:
+        return files.update(
+            fileId=existing["id"], media_body=media, fields="id, name, webViewLink"
+        ).execute()
+    return files.create(
+        body={"name": name, "parents": [parent]},
+        media_body=media,
+        fields="id, name, webViewLink",
+    ).execute()
+
+
+def drive_download(file_id):
+    request = drive_service().files().get_media(fileId=file_id)
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buffer.getvalue()
+
+
+def drive_list_json(parent):
+    """All .json files directly inside a Drive folder."""
+    files, token = [], None
+    while True:
+        result = drive_service().files().list(
+            q=f"'{parent}' in parents and trashed = false and mimeType != '{FOLDER_MIME}'",
+            spaces="drive",
+            fields="nextPageToken, files(id, name, modifiedTime)",
+            orderBy="name",
+            pageSize=100,
+            pageToken=token,
+        ).execute()
+        files += [f for f in result.get("files", []) if f["name"].lower().endswith(".json")]
+        token = result.get("nextPageToken")
+        if not token:
+            return files
+
+
+# ============================================================
+# CLASSGROOT — BRANCH CLASSIFIER
+# ============================================================
+
+
+def save_training_db(topics, labels):
+    if st.session_state.get("_training_unsynced"):
+        st.warning(
+            "The stored training database could not be read, so your changes are kept for this "
+            "session only (the stored copy is protected from being overwritten)."
+        )
+        return
+
+    payload = json.dumps({"topics": topics, "labels": labels}, indent=4, ensure_ascii=False)
+
+    if drive_enabled():
+        try:
+            drive_upload(TRAINING_FILENAME, payload.encode("utf-8"), JSON_MIME, drive_folders()["root"])
+            return
+        except Exception as exc:
+            st.warning(f"Could not save the training data to Google Drive ({drive_error(exc)}). Saved locally instead.")
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    TRAINING_DATA_PATH.write_text(payload, encoding="utf-8")
+
+
+def _read_training_file():
+    """Parsed training JSON from Drive (if configured) or local storage; None if it doesn't exist yet."""
+    if drive_enabled():
+        found = drive_find(TRAINING_FILENAME, drive_folders()["root"])
+        return json.loads(drive_download(found["id"]).decode("utf-8")) if found else None
+    if TRAINING_DATA_PATH.exists():
+        return json.loads(TRAINING_DATA_PATH.read_text(encoding="utf-8"))
+    return None
+
+
+def load_training_database():
+    defaults = (list(DEFAULT_TOPICS), list(DEFAULT_LABELS))
+
+    try:
+        data = _read_training_file()
+        if data is not None and not isinstance(data, dict):
+            raise ValueError("unexpected file format")
+    except Exception as exc:
+        st.warning(
+            f"Could not read the training database ({drive_error(exc)}). "
+            "Using defaults for this session; the stored copy will not be overwritten."
+        )
+        st.session_state["_training_unsynced"] = True
+        return defaults
+
+    if data is not None:
+        topics, labels = data.get("topics", []), data.get("labels", [])
+        if topics and len(topics) == len(labels):
+            return topics, labels
+        if topics or labels:
+            st.warning(
+                "The training database is corrupted (topics and labels differ in length). "
+                "Using defaults for this session; the stored copy will not be overwritten."
+            )
+            st.session_state["_training_unsynced"] = True
+            return defaults
+
+    # Missing or empty -> create it from the defaults
+    save_training_db(*defaults)
+    return defaults
+
+
+def train_branch_model(topics, labels):
+    if not topics or len(topics) != len(labels):
+        raise ValueError("Training database is empty or corrupted. ClassGroot cannot be trained.")
+    vectorizer = TfidfVectorizer()
+    model = SGDClassifier(random_state=42)
+    model.fit(vectorizer.fit_transform(topics), labels)
+    return vectorizer, model
+
+
+def get_classifier():
+    if "clf" not in st.session_state:
+        topics, labels = load_training_database()
+        vectorizer, model = train_branch_model(topics, labels)
+        st.session_state.clf = {
+            "topics": topics, "labels": labels, "vec": vectorizer, "model": model,
+        }
+    return st.session_state.clf
+
+
+def predict_branch(title):
+    clf = get_classifier()
+    return clf["model"].predict(clf["vec"].transform([title]))[0]
+
+
+def add_training_examples(pairs):
+    """Add (title, branch) pairs, save, and retrain. Returns how many were new."""
+    clf = get_classifier()
+    existing = set(zip(clf["topics"], clf["labels"]))
+    added = 0
+    for title, branch in pairs:
+        title, branch = str(title).strip(), str(branch).strip().lower()
+        if title and branch in BRANCHES and (title, branch) not in existing:
+            clf["topics"].append(title)
+            clf["labels"].append(branch)
+            existing.add((title, branch))
+            added += 1
+    if added:
+        save_training_db(clf["topics"], clf["labels"])
+        clf["vec"], clf["model"] = train_branch_model(clf["topics"], clf["labels"])
+    return added
+
+
+def parse_training_batch(text):
+    cleaned = re.sub(r"```(?:json)?", "", text).strip()
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError("The AI response did not contain JSON.")
+    data = json.loads(cleaned[start:end + 1])
+
+    rows = []
+    for example in data.get("training_examples", []):
+        title = str(example.get("title", "")).strip()
+        branch = str(example.get("branch", "")).strip().lower()
+        if title and branch in BRANCHES:
+            rows.append({"keep": True, "title": title, "branch": branch})
+    if not rows:
+        raise ValueError("No valid training examples found in the AI response.")
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# THESIS SAVE / LOAD
+# ============================================================
+
+
+def thesis_payload(sections):
+    return {
+        "thesisforge_version": VERSION,
+        "sections": normalize_sections(copy.deepcopy(sections)),
+    }
+
+
+def parse_thesis(data):
+    if not isinstance(data, dict) or "sections" not in data:
+        raise ValueError("Invalid thesis file: missing 'sections'.")
+    if not isinstance(data["sections"], dict):
+        raise ValueError("Invalid thesis file: 'sections' must be a dictionary.")
+    return normalize_sections(copy.deepcopy(data["sections"]))
+
+
+def list_saved_theses(refresh=False):
+    """[{'name': ..., 'id': Drive file id or None}] from Drive (if configured) or local storage."""
+    if drive_enabled():
+        cache = st.session_state.get("_thesis_list")
+        if cache is None or refresh:
+            cache = [
+                {"name": f["name"], "id": f["id"]}
+                for f in drive_list_json(drive_folders()["theses"])
+            ]
+            st.session_state["_thesis_list"] = cache
+        return cache
+    return [{"name": p.name, "id": None} for p in sorted(THESIS_DIR.glob("*.json"))]
+
+
+def read_saved_thesis(name, file_id=None):
+    if file_id:
+        return json.loads(drive_download(file_id).decode("utf-8"))
+    return json.loads((THESIS_DIR / name).read_text(encoding="utf-8"))
+
+
+def save_thesis(sections, filename):
+    """Save to Google Drive when configured, otherwise to local storage. Returns where it went."""
+    filename = os.path.basename(filename.strip())
+    if not filename:
+        raise ValueError("Filename cannot be empty.")
+    if not filename.lower().endswith(".json"):
+        filename += ".json"
+
+    payload = json.dumps(thesis_payload(sections), indent=4, ensure_ascii=False)
+
+    if drive_enabled():
+        drive_upload(filename, payload.encode("utf-8"), JSON_MIME, drive_folders()["theses"])
+        st.session_state.pop("_thesis_list", None)
+        return f"Google Drive → {drive_root_name()}/Theses/{filename}"
+
+    path = THESIS_DIR / filename
+    path.write_text(payload, encoding="utf-8")
+    return f"local storage → {path}"
+
+
+# ============================================================
+# WORD EXPORT (one builder for all four styles)
+# ============================================================
+
+EXPORT_STYLES = {
+    "Formal Academic": {
+        "suffix": "", "top": None, "layout": "inline",
+        "headings": [
+            "Abstract", "1. Introduction", "2. Literature Review",
+            "3. Theoretical Framework / Proposed Model", "4. Research Methodology",
+            "5. Results / Findings", "6. Discussion", "7. Conclusion",
+            "8. References / Bibliography", "9. Appendices",
+        ],
+    },
+    "Professional": {
+        "suffix": "_Professional", "top": "RESEARCH REPORT", "layout": "inline",
+        "headings": [
+            "Executive Summary", "Introduction", "Literature Review",
+            "Theoretical Framework / Proposed Model", "Methodology",
+            "Results / Findings", "Discussion", "Conclusion", "References", "Appendices",
+        ],
+    },
+    "Casual": {
+        "suffix": "_Casual", "top": None, "layout": "inline",
+        "headings": [
+            "So, what is this research about?", "Let's start with the introduction...",
+            "What does the existing research say?", "The theoretical framework / proposed model:",
+            "How was the research carried out?", "What did we find?",
+            "What do these results mean?", "Final thoughts:", "Sources used:",
+            "Extra information:",
+        ],
+    },
+    "Simple & Easy-to-Read": {
+        "suffix": "_Simple", "top": "RESEARCH PAPER", "layout": "blocks",
+        "headings": [
+            "WHAT IS THIS ABOUT?", "INTRODUCTION", "PREVIOUS RESEARCH",
+            "THEORETICAL FRAMEWORK / PROPOSED MODEL", "METHOD", "WHAT WE FOUND",
+            "WHAT THE RESULTS MEAN", "CONCLUSION", "SOURCES", "APPENDICES",
+        ],
+    },
+}
+
+
+def build_docx(sections, style_name):
+    cfg = EXPORT_STYLES[style_name]
+    doc = Document()
+    branch = (sections.get("dominant_branch") or "unknown").title()
+
+    if cfg["layout"] == "blocks":
+        doc.add_heading(cfg["top"], 0)
+        for label, key in (("TITLE", "title"), ("AUTHOR", "author"), ("DATE", "date")):
+            doc.add_heading(label, level=1)
+            doc.add_paragraph(sections[key])
+    else:
+        if cfg["top"]:
+            doc.add_heading(cfg["top"], 0)
+            doc.add_paragraph(sections["title"])
+        else:
+            doc.add_heading(sections["title"], 0)
+        doc.add_paragraph("Author: " + sections["author"])
+        doc.add_paragraph("Date: " + sections["date"])
+
+    doc.add_paragraph("Dominant Research Branch: " + branch)
+
+    for key, heading in zip(SECTION_KEYS, cfg["headings"]):
+        doc.add_heading(heading, level=1)
+        doc.add_paragraph(sections[key])
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    return buffer.getvalue(), safe_filename(sections["title"], cfg["suffix"])
+
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+P_HOME = "🏠 Home"
+P_EDIT = "📝 Editor"
+P_ENHANCE = "✨ Enhance with AI"
+P_CHAT = "💬 ThesisBot Chat"
+P_PREVIEW = "👁️ Preview"
+P_VERSIONS = "🗂️ Versions"
+P_EXPORT = "📄 Export to Word"
+P_PROJECTS = "💾 Save / Open"
+P_BRAIN = "🧠 BrainPad"
+P_HELP = "❓ Help"
+P_TRAIN = "🔬 ClassGroot Training"
+P_SETUP = "⚙️ Setup Guide"
+
+
+def init_state():
+    defaults = {
+        "page": P_HOME,
+        "sections": blank_sections(),
+        "versions": [],
+        "chat_history": [],
+        "brain_pad": "",
+        "brain_name": "",
+        "use_brainpad": False,
+        "proposal": None,
+        "train_auth": False,
+        "train_fails": 0,
+        "batch": None,
+        "greeting": random.choice(GREETINGS),
+        "tip": random.choice(TIPS),
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
+
+
+def go(page):
+    st.session_state.page = page
+
+
+def new_thesis():
+    st.session_state.sections = blank_sections()
+    st.session_state.chat_history = []
+    st.session_state.proposal = None
+    st.session_state.page = P_EDIT
+    flash("info", "Started a blank thesis. Fill in the details and press **Apply changes**.")
+
+
+def source_picker(label, key):
+    """Pick the current thesis or one of the saved versions."""
+    options = ["Current thesis"] + [v["version"] for v in st.session_state.versions]
+    choice = st.selectbox(label, options, key=key)
+    for version in st.session_state.versions:
+        if version["version"] == choice:
+            return version["sections"]
+    return st.session_state.sections
+
+
+def final_tips():
+    """ThesisBot's closing message from the original Mark 35."""
+    with st.container(border=True):
+        st.markdown("**ThesisBot has a few final research tips for you:**")
+        st.write(random.choice(TIPS))
+        st.markdown(
+            "**Remember:** a proposed model or hypothesis should be clearly distinguished "
+            "from an experimentally established theory."
+        )
+        st.success("ThesisBot: Your research document is complete!")
+        st.caption(random.choice(TIPS))
+
+
+# ============================================================
+# PAGES
+# ============================================================
+
+
+def page_home():
+    st.title(f"🔬 {APP_NAME}")
+    st.caption(VERSION)
+    st.info(st.session_state.greeting)
+    st.write(
+        "Your scientific research assistant for organizing, enhancing, "
+        "classifying, and formatting research."
+    )
+
+    c1, c2, c3 = st.columns(3)
+    c1.button("➕ New thesis", on_click=new_thesis, type="primary")
+    c2.button("📂 Open a saved thesis", on_click=go, args=(P_PROJECTS,))
+    c3.link_button("🧠 Brainstorm with BrainStormAI", BRAINSTORM_URL)
+
+    st.subheader("How it works")
+    st.markdown(
+        """
+1. **Write** your thesis in the Editor (ClassGroot detects the research branch from your title).
+2. **Enhance** any section with ThesisBot, or **chat** about your project.
+3. **Save versions** as you go, then **export** to a Word document in four styles.
+4. **Save** the project to reopen it later.
+        """
+    )
+    st.caption(f"💡 {st.session_state.tip}")
+
+
+def page_editor():
+    st.header("📝 Write / Edit Thesis")
+    s = st.session_state.sections
+
+    filled = sum(1 for k in SECTION_KEYS if s[k].strip())
+    st.progress(filled / len(SECTION_KEYS), text=f"{filled} of {len(SECTION_KEYS)} sections written")
+
+    branch_options = ["Auto-detect (ClassGroot)", "Biology", "Chemistry", "Physics"]
+    current_branch = (s["dominant_branch"] or "").title()
+    default_index = branch_options.index(current_branch) if current_branch in branch_options else 0
+
+    with st.form("editor_form"):
+        tabs = st.tabs(["Details"] + [SECTION_LABELS[k] for k in SECTION_KEYS])
+
+        with tabs[0]:
+            title = st.text_input("Title", value=s["title"])
+            c1, c2 = st.columns(2)
+            author = c1.text_input("Author", value=s["author"])
+            date = c2.text_input("Date", value=s["date"])
+            branch_choice = st.selectbox(
+                "Dominant research branch",
+                branch_options,
+                index=default_index,
+                help="Choose Auto-detect to let ClassGroot predict it. If you pick a different "
+                     "branch than ClassGroot predicts, the correction is learned.",
+            )
+
+        values = {}
+        for tab, key in zip(tabs[1:], SECTION_KEYS):
+            with tab:
+                values[key] = st.text_area(SECTION_LABELS[key], value=s[key], height=320)
+
+        submitted = st.form_submit_button("💾 Apply changes", type="primary")
+
+    if submitted:
+        title = title.strip() or "Untitled Research Project"
+        predicted = predict_branch(title)
+
+        if branch_choice.startswith("Auto"):
+            branch = predicted
+            note = f"ClassGroot predicted **{branch.title()}**."
+        else:
+            branch = branch_choice.lower()
+            note = f"Branch set to **{branch.title()}**."
+            if branch != predicted and add_training_examples([(title, branch)]):
+                note += " Your correction was added to ClassGroot's training data."
+
+        s.update(title=title, author=author, date=date, dominant_branch=branch, **values)
+        flash("success", f"Changes applied. {note}")
+        st.rerun()
+
+
+def accept_proposal():
+    proposal = st.session_state.proposal
+    if proposal:
+        st.session_state.sections[proposal["key"]] = proposal["text"]
+        flash("success", f"{proposal['label']} replaced with the enhanced version.")
+    st.session_state.proposal = None
+
+
+def discard_proposal():
+    st.session_state.proposal = None
+    flash("info", "Original version kept.")
+
+
+def page_enhance():
+    st.header("✨ Enhance a Section with ThesisBot")
+    s = st.session_state.sections
+
+    options = ["title"] + SECTION_KEYS
+    labels = {"title": "Title", **SECTION_LABELS}
+    key = st.selectbox("Section to enhance", options, format_func=lambda k: labels[k])
+
+    with st.expander("Current text", expanded=True):
+        st.write(s[key] or "*This section is empty.*")
+
+    instruction = st.text_area(
+        "How should ThesisBot improve it?",
+        placeholder="e.g. Make it more concise and add a clearer statement of the research gap.",
+    )
+
+    if st.button("✨ Enhance", type="primary"):
+        if not instruction.strip():
+            st.warning("Please enter an enhancement instruction.")
+        elif not s[key].strip():
+            st.warning("That section is empty. Write something first.")
+        else:
+            prompt = (
+                "You are ThesisBot inside Atharvian ThesisForge Lab.\n\n"
+                "User's enhancement instruction:\n" + instruction.strip() + "\n\n"
+                "Only provide the improved text for this section. "
+                "Do not provide commentary, options, variants, or "
+                "explanations outside the improved section.\n\n"
+                "Section:\n" + s[key]
+            )
+            with st.spinner("ThesisBot is working..."):
+                text = ask_ai(prompt)
+            if text:
+                st.session_state.proposal = {"key": key, "label": labels[key], "text": text}
+
+    proposal = st.session_state.proposal
+    if proposal:
+        st.subheader(f"Proposed version — {proposal['label']}")
+        st.write(proposal["text"])
+        c1, c2, _ = st.columns([1, 1, 3])
+        c1.button("✅ Use this version", on_click=accept_proposal, type="primary")
+        c2.button("↩️ Keep original", on_click=discard_proposal)
+
+
+def page_chat():
+    st.header("💬 ThesisBot Chat")
+    st.caption("Ask questions about your thesis. ThesisBot sees your current draft.")
+
+    history = st.session_state.chat_history
+    for message in history:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    user_prompt = st.chat_input("Ask ThesisBot about your project...")
+    if user_prompt:
+        with st.chat_message("user"):
+            st.markdown(user_prompt)
+
+        recent = "\n".join(
+            f"{'User' if m['role'] == 'user' else 'ThesisBot'}: {m['content']}"
+            for m in history[-10:]
+        )
+        prompt = f"""
+You are ThesisBot, the research assistant inside
+Atharvian ThesisForge Lab.
+
+CURRENT THESIS:
+{json.dumps(st.session_state.sections, indent=1, ensure_ascii=False)}
+
+RECENT CONVERSATION:
+{recent}
+
+USER:
+{user_prompt}
+
+Answer the user using the thesis and recent conversation as context.
+
+Be scientifically responsible:
+- Distinguish established evidence from hypotheses.
+- Do not pretend speculation is established fact.
+- Explain uncertainty when appropriate.
+- Help the researcher understand and improve their work.
+"""
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                answer = ask_ai(prompt)
+            if answer:
+                st.markdown(answer)
+
+        if answer:
+            history.append({"role": "user", "content": user_prompt})
+            history.append({"role": "assistant", "content": answer})
+            st.session_state.chat_history = history[-10:]
+
+    if history and st.button("🗑️ Clear chat"):
+        st.session_state.chat_history = []
+        st.rerun()
+
+
+def page_preview():
+    st.header("👁️ Thesis Preview")
+    s = st.session_state.sections
+    if not s["title"] and not any(s[k].strip() for k in SECTION_KEYS):
+        st.info("Nothing to preview yet. Write something in the Editor first.")
+        return
+
+    st.title(s["title"] or "Untitled")
+    st.caption(
+        f"**Author:** {s['author'] or '—'}  |  **Date:** {s['date'] or '—'}  |  "
+        f"**Branch:** {(s['dominant_branch'] or 'unknown').title()}"
+    )
+    for i, key in enumerate(SECTION_KEYS):
+        heading = SECTION_LABELS[key] if i == 0 else f"{i}. {SECTION_LABELS[key]}"
+        with st.expander(heading, expanded=(i < 2)):
+            st.markdown(s[key] or "*Empty*")
+
+
+# ---------- versions ----------
+
+def load_version(index):
+    version = st.session_state.versions[index]
+    st.session_state.sections = copy.deepcopy(version["sections"])
+    flash("success", f"Loaded **{version['version']}**. Any unsaved changes to the previous draft were replaced.")
+
+
+def delete_version(index):
+    removed = st.session_state.versions.pop(index)
+    flash("info", f"Deleted **{removed['version']}**.")
+
+
+def page_versions():
+    st.header("🗂️ Versions")
+    st.caption("Snapshots of your thesis. Loading a version replaces the current draft, so save first!")
+
+    with st.form("version_form", clear_on_submit=True):
+        name = st.text_input("Name for this version")
+        if st.form_submit_button("📌 Save current draft as a version", type="primary"):
+            if not name.strip():
+                st.warning("Please enter a name.")
+            else:
+                versions = st.session_state.versions
+                label = f"{name.strip()}({len(versions)})"
+                versions.append({"version": label, "sections": copy.deepcopy(st.session_state.sections)})
+                flash("success", f"Saved as **{label}**.")
+                st.rerun()
+
+    versions = st.session_state.versions
+    if not versions:
+        st.info("No versions saved yet.")
+        return
+
+    st.subheader("Saved versions")
+    for i, version in enumerate(versions):
+        c1, c2, c3 = st.columns([4, 1, 1])
+        c1.markdown(f"**{version['version']}** — {version['sections'].get('title') or 'Untitled'}")
+        c2.button("Load", key=f"load_{i}", on_click=load_version, args=(i,))
+        c3.button("Delete", key=f"del_{i}", on_click=delete_version, args=(i,))
+
+
+# ---------- export ----------
+
+def page_export():
+    st.header("📄 Export to Word")
+    sections = source_picker("Which version do you want to export?", "export_src")
+    style = st.radio("Document style", list(EXPORT_STYLES), horizontal=True)
+
+    if not sections["title"].strip():
+        st.warning("This thesis has no title yet. The file will be named 'Research_Paper'.")
+
+    data, filename = build_docx(sections, style)
+    if st.download_button(
+        f"⬇️ Download {filename}",
+        data=data,
+        file_name=filename,
+        mime=DOCX_MIME,
+        type="primary",
+    ):
+        final_tips()
+
+    if drive_enabled():
+        if st.button("☁️ Save a copy to Google Drive"):
+            try:
+                with st.spinner("Uploading to Google Drive..."):
+                    uploaded = drive_upload(filename, data, DOCX_MIME, drive_folders()["exports"])
+                st.success(f"Saved to Google Drive → {drive_root_name()}/Exports/{filename}")
+                if uploaded.get("webViewLink"):
+                    st.link_button("Open in Google Drive", uploaded["webViewLink"])
+            except Exception as exc:
+                st.error(drive_error(exc))
+        st.caption("A file with the same name in the Exports folder is overwritten.")
+
+    st.caption(
+        "Remember: a proposed model or hypothesis should be clearly distinguished "
+        "from an experimentally established theory."
+    )
+
+
+# ---------- save / open ----------
+
+def open_saved(name, file_id=None):
+    try:
+        st.session_state.sections = parse_thesis(read_saved_thesis(name, file_id))
+        st.session_state.page = P_EDIT
+        flash("success", f"Opened **{name}**.")
+    except Exception as exc:
+        flash("error", f"Could not open that file: {drive_error(exc)}")
+
+
+def open_uploaded():
+    uploaded = st.session_state.get("thesis_upload")
+    if uploaded is None:
+        return
+    try:
+        st.session_state.sections = parse_thesis(json.loads(uploaded.getvalue().decode("utf-8")))
+        st.session_state.page = P_EDIT
+        flash("success", f"Opened **{uploaded.name}**.")
+    except Exception as exc:
+        flash("error", f"That is not a valid ThesisForge Lab JSON file: {exc}")
+
+
+def drive_status_block():
+    if not DRIVE_LIBS_OK:
+        st.warning(
+            "The Google API packages are not installed (google-api-python-client, google-auth), "
+            "so files are stored on the app server only."
+        )
+        return
+    if not drive_enabled():
+        st.info(
+            "☁️ Google Drive is not configured, so files are stored on the app server only. "
+            "Add a `[gdrive]` section to the Streamlit secrets to enable Drive."
+        )
+        return
+
+    c1, c2 = st.columns([4, 1])
+    c1.success(f"☁️ Google Drive connected — files go to **{drive_root_name()}** in your My Drive.")
+    if c2.button("Test connection"):
+        try:
+            about = drive_service().about().get(fields="user(displayName, emailAddress)").execute()
+            drive_folders()
+            user = about.get("user", {})
+            st.success(f"Connected as {user.get('displayName', '?')} ({user.get('emailAddress', '?')}).")
+        except Exception as exc:
+            st.error(drive_error(exc))
+
+
+def page_projects():
+    st.header("💾 Save / Open")
+    drive_status_block()
+    where = "Google Drive" if drive_enabled() else "local storage"
+    tab_save, tab_open = st.tabs(["Save", "Open"])
+
+    with tab_save:
+        sections = source_picker("Which version do you want to save?", "save_src")
+        with st.form("save_form"):
+            filename = st.text_input(
+                "File name",
+                value=safe_filename(sections["title"], ext="")[:60] if sections["title"] else "",
+            )
+            if st.form_submit_button(f"💾 Save to {where}", type="primary"):
+                try:
+                    with st.spinner("Saving..."):
+                        saved_to = save_thesis(sections, filename)
+                    st.success(f"Saved to {saved_to}")
+                    final_tips()
+                except Exception as exc:
+                    st.error(drive_error(exc))
+        st.caption("Saving with an existing name overwrites that file.")
+
+        st.download_button(
+            "⬇️ Download as JSON (your own backup)",
+            data=json.dumps(thesis_payload(sections), indent=4, ensure_ascii=False),
+            file_name=safe_filename(sections["title"] or "thesis", ext=".json"),
+            mime=JSON_MIME,
+        )
+
+    with tab_open:
+        st.subheader(f"From {where}")
+        try:
+            saved = list_saved_theses()
+        except Exception as exc:
+            saved = []
+            st.error(drive_error(exc))
+
+        if saved:
+            by_name = {item["name"]: item for item in saved}
+            chosen = st.selectbox("Saved theses", list(by_name))
+            c1, c2, _ = st.columns([1, 1, 3])
+            c1.button("📂 Open", on_click=open_saved, args=(chosen, by_name[chosen]["id"]), type="primary")
+            if drive_enabled() and c2.button("🔄 Refresh list"):
+                st.session_state.pop("_thesis_list", None)
+                st.rerun()
+        else:
+            st.info("No saved theses found yet.")
+            if drive_enabled() and st.button("🔄 Refresh list"):
+                st.session_state.pop("_thesis_list", None)
+                st.rerun()
+
+        st.subheader("Or upload a JSON file")
+        st.file_uploader("ThesisForge Lab JSON", type=["json"], key="thesis_upload")
+        if st.session_state.get("thesis_upload") is not None:
+            st.button("📂 Open uploaded file", on_click=open_uploaded)
+
+
+# ---------- BrainPad ----------
+
+def apply_brainpad(data, name):
+    pad = data.get("brain_pad", "") if isinstance(data, dict) else ""
+    if not pad:
+        raise ValueError("No 'brain_pad' found in that file.")
+    st.session_state.brain_pad = pad
+    st.session_state.brain_name = name
+    st.session_state.use_brainpad = True
+
+
+def load_brainpad():
+    """Callback: load the BrainPad from an uploaded file."""
+    uploaded = st.session_state.get("brain_upload")
+    if uploaded is None:
+        return
+    try:
+        apply_brainpad(json.loads(uploaded.getvalue().decode("utf-8")), uploaded.name)
+        flash("success", f"BrainPad from **{uploaded.name}** loaded and enabled as AI context.")
+    except Exception as exc:
+        flash("error", f"Error loading project: {exc}")
+
+
+def load_brainpad_from_drive(file_id, name):
+    """Callback: load the BrainPad from a BrainStormAI project on Google Drive."""
+    try:
+        apply_brainpad(json.loads(drive_download(file_id).decode("utf-8")), name)
+        flash("success", f"BrainPad from **{name}** loaded and enabled as AI context.")
+    except Exception as exc:
+        flash("error", f"Error loading project: {drive_error(exc)}")
+
+
+def clear_brainpad():
+    st.session_state.brain_pad = ""
+    st.session_state.brain_name = ""
+    st.session_state.use_brainpad = False
+    flash("info", "BrainPad removed.")
+
+
+def list_brainstorm_projects(refresh=False):
+    """BrainStormAI project files on Drive, or None if the folder doesn't exist."""
+    cache = st.session_state.get("_brain_list")
+    if cache is None or refresh:
+        folder = drive_find(drive_config_value("brainstorm_folder", "BrainstormAI"), "root", folder=True)
+        cache = {"files": drive_list_json(folder["id"]) if folder else None}
+        st.session_state["_brain_list"] = cache
+    return cache["files"]
+
+
+def page_brainpad():
+    st.header("🧠 BrainPad (from BrainStormAI)")
+    st.link_button("Open BrainStormAI", BRAINSTORM_URL)
+
+    if st.session_state.brain_pad:
+        st.success(f"Loaded: {st.session_state.brain_name}")
+        st.caption("Use the sidebar checkbox to turn it on/off as AI context.")
+        st.markdown(format_brainpad(st.session_state.brain_pad))
+        st.button("Remove BrainPad", on_click=clear_brainpad)
+        st.divider()
+
+    if drive_enabled():
+        folder_name = drive_config_value("brainstorm_folder", "BrainstormAI")
+        st.subheader("From Google Drive")
+        projects = []
+        try:
+            found = list_brainstorm_projects()
+            if found is None:
+                st.info(f"No folder named '{folder_name}' was found in your My Drive.")
+            elif not found:
+                st.info(f"No project files found in '{folder_name}'.")
+            else:
+                projects = found
+        except Exception as exc:
+            st.error(drive_error(exc))
+
+        if projects:
+            by_name = {p["name"][:-5]: p for p in projects}  # strip ".json"
+            chosen = st.selectbox("BrainStorm project", list(by_name))
+            st.button(
+                "Load from Google Drive",
+                on_click=load_brainpad_from_drive,
+                args=(by_name[chosen]["id"], by_name[chosen]["name"]),
+                type="primary",
+            )
+        if st.button("🔄 Refresh project list"):
+            st.session_state.pop("_brain_list", None)
+            st.rerun()
+        st.divider()
+
+    st.subheader("Upload a project file")
+    st.file_uploader("BrainStormAI project (.json)", type=["json"], key="brain_upload")
+    if st.session_state.get("brain_upload") is not None:
+        st.button("Load uploaded BrainPad", on_click=load_brainpad, type="primary")
+
+
+# ---------- help ----------
+
+def page_help():
+    st.header("❓ Help — ask about ThesisForge Lab")
+    doubt = st.text_area("What is your doubt about ThesisForge Lab?")
+    if st.button("Ask", type="primary"):
+        if not doubt.strip():
+            st.warning("Please type your question.")
+            return
+        try:
+            project_code = Path(__file__).read_text(encoding="utf-8")
+        except Exception:
+            project_code = "(source code unavailable)"
+        prompt = (
+            "You are the coding and operation assistant for Atharvian ThesisForge Lab.\n\n"
+            "User's doubt:\n" + doubt + "\n\n"
+            f"The project is a scientific research assistant called ThesisForge Lab {VERSION}, "
+            "built with Streamlit.\n\n"
+            "Relevant project code:\n" + project_code + "\n\n"
+            "Analyze the problem clearly. Explain how the user should operate the application "
+            "or understand the error. Do not invent features that do not exist."
+        )
+        with st.spinner("Thinking..."):
+            answer = ask_ai(prompt)
+        if answer:
+            st.markdown(answer)
+
+
+# ---------- ClassGroot training (passcode protected) ----------
+
+def add_manual_example():
+    """Callback: add the typed training title with the branch the user confirmed."""
+    title = st.session_state.get("train_title", "").strip()
+    if not title:
+        return
+    predicted = predict_branch(title)
+    branch = st.session_state.get(f"train_branch_{predicted}", predicted.title()).lower()
+    if add_training_examples([(title, branch)]):
+        flash("success", "Training example added to the database and ClassGroot retrained.")
+    else:
+        flash("info", "That example already exists in the database.")
+    st.session_state["train_title"] = ""
+
+
+def page_training():
+    st.header("🔬 ClassGroot Training Station")
+
+    # ----- passcode gate -----
+    if not st.session_state.train_auth:
+        if st.session_state.train_fails >= 3:
+            st.error("Too many failed attempts. Training mode is locked for this session.")
+            return
+        with st.form("train_login"):
+            code = st.text_input("Passcode", type="password")
+            if st.form_submit_button("Unlock", type="primary"):
+                expected = get_secret("SecurityPasscode")
+                if expected and hmac.compare_digest(str(code).encode(), str(expected).encode()):
+                    st.session_state.train_auth = True
+                    st.rerun()
+                else:
+                    st.session_state.train_fails += 1
+                    left = 3 - st.session_state.train_fails
+                    st.error(f"Access denied. {left} attempt(s) left.")
+        return
+
+    # ----- authenticated -----
+    clf = get_classifier()
+    top = st.columns([4, 1])
+    top[0].success("Access granted. Hello Dhruv. Welcome to the ClassGroot training station.")
+    if top[1].button("🔒 Lock"):
+        st.session_state.train_auth = False
+        st.rerun()
+
+    counts = pd.Series(clf["labels"]).value_counts()
+    cols = st.columns(4)
+    cols[0].metric("Total examples", len(clf["labels"]))
+    for col, branch in zip(cols[1:], BRANCHES):
+        col.metric(branch.title(), int(counts.get(branch, 0)))
+
+    with st.expander("Prescribed workflow"):
+        st.code(WORKFLOW_DIAGRAM, language=None)
+
+    tab_ai, tab_manual, tab_test = st.tabs(["🤖 AI batch", "✍️ Add manually", "🧪 Test classifier"])
+
+    with tab_ai:
+        st.caption("Generate a batch, review it, untick anything wrong, fix branches, then add.")
+        n = st.slider("Number of titles", 10, 100, 100, step=10)
+        if st.button("Generate batch"):
+            prompt = f"""
+Generate {n} research titles.
+For each, give the title and its primary branch:
+biology, chemistry, or physics.
+Include some cross-disciplinary titles.
+Return only JSON:
+{{"training_examples":[{{"title":"...","branch":"biology"}}]}}
+"""
+            with st.spinner("Generating training data..."):
+                text = ask_ai(prompt)
+            if text:
+                try:
+                    st.session_state.batch = parse_training_batch(text)
+                except Exception as exc:
+                    st.error(f"Could not read the AI's response: {exc}")
+                    with st.expander("Raw response"):
+                        st.code(text)
+
+        if st.session_state.batch is not None:
+            edited = st.data_editor(
+                st.session_state.batch,
+                key="batch_editor",
+                hide_index=True,
+                column_config={
+                    "keep": st.column_config.CheckboxColumn("Keep", default=True),
+                    "title": st.column_config.TextColumn("Title"),
+                    "branch": st.column_config.SelectboxColumn("Branch", options=BRANCHES, required=True),
+                },
+            )
+            c1, c2, _ = st.columns([2, 1, 3])
+            if c1.button("✅ Add selected to database", type="primary"):
+                chosen = edited[edited["keep"].fillna(False).astype(bool)]
+                added = add_training_examples(zip(chosen["title"], chosen["branch"]))
+                st.session_state.batch = None
+                flash("success", f"Added {added} new example(s). ClassGroot retrained!")
+                st.rerun()
+            if c2.button("🗑️ Discard"):
+                st.session_state.batch = None
+                flash("info", "Training batch rejected.")
+                st.rerun()
+
+    with tab_manual:
+        st.caption("Type a title, check ClassGroot's prediction, correct it if needed, then add it.")
+        title = st.text_input("Training title", key="train_title")
+        if title.strip():
+            predicted = predict_branch(title)
+            st.write("Predicted dominant branch:", f"**{predicted.title()}**")
+            st.selectbox(
+                "Correct branch",
+                [b.title() for b in BRANCHES],
+                index=BRANCHES.index(predicted),
+                key=f"train_branch_{predicted}",
+            )
+            st.button("Add example", on_click=add_manual_example, type="primary")
+
+    with tab_test:
+        test_title = st.text_input("Type a research title to test")
+        if test_title.strip():
+            st.write("Predicted dominant branch:", f"**{predict_branch(test_title).title()}**")
+
+
+def page_setup():
+    st.header("⚙️ Setup Guide")
+
+    st.subheader("Status")
+    checks = {
+        "OPENROUTER_API_KEY — AI features": bool(get_secret("OPENROUTER_API_KEY")),
+        "SecurityPasscode — ClassGroot training": bool(get_secret("SecurityPasscode")),
+        "[gdrive] — Google Drive save & upload": drive_enabled(),
+    }
+    for label, ok in checks.items():
+        st.write(("✅ " if ok else "❌ ") + label)
+    if not DRIVE_LIBS_OK:
+        st.warning("google-api-python-client / google-auth are not installed, so Drive is unavailable.")
+
+    st.subheader("1. requirements.txt")
+    st.code(REQUIREMENTS_TXT, language="text")
+    st.download_button("⬇️ Download requirements.txt", REQUIREMENTS_TXT, file_name="requirements.txt")
+
+    st.subheader("2. Secrets")
+    st.caption("Put this in .streamlit/secrets.toml, or in the Secrets box on Streamlit Community Cloud.")
+    st.code(SECRETS_TEMPLATE, language="toml")
+
+    st.subheader("3. Connect Google Drive (one time)")
+    st.markdown(
+        """
+1. In **Google Cloud Console**, create a project and enable the **Google Drive API**.
+2. Configure the **OAuth consent screen** and set its publishing status to **In production**
+   *before* making the token. Tokens made while the app is in "Testing" expire after 7 days.
+3. **Credentials → Create credentials → OAuth client ID → Desktop app**, then download the JSON and
+   save it as `client_secret.json` next to `app.py` on your own computer.
+4. Run this command, sign in with the Google account whose Drive you want to use, and click through
+   the "unverified app" warning (Advanced → continue):
+        """
+    )
+    st.code("pip install google-auth-oauthlib\npython app.py --get-drive-token", language="bash")
+    st.markdown(
+        "5. Paste the printed `[gdrive]` block into your secrets, then open **Save / Open** and "
+        "press **Test connection**."
+    )
+    st.caption(
+        "The refresh token gives access to your Drive. Never commit secrets.toml or "
+        "client_secret.json to GitHub."
+    )
+
+
+# ============================================================
+# NAVIGATION & MAIN
+# ============================================================
+
+PAGES = {
+    P_HOME: page_home,
+    P_EDIT: page_editor,
+    P_ENHANCE: page_enhance,
+    P_CHAT: page_chat,
+    P_PREVIEW: page_preview,
+    P_VERSIONS: page_versions,
+    P_EXPORT: page_export,
+    P_PROJECTS: page_projects,
+    P_BRAIN: page_brainpad,
+    P_HELP: page_help,
+    P_TRAIN: page_training,
+    P_SETUP: page_setup,
+}
+
+
+def sidebar():
+    with st.sidebar:
+        st.title("🔬 ThesisForge Lab")
+        st.caption(VERSION)
+        st.radio("Navigate", list(PAGES), key="page", label_visibility="collapsed")
+        st.divider()
+
+        s = st.session_state.sections
+        st.markdown(f"**Current thesis**\n\n{s['title'] or '— not started —'}")
+        st.caption(f"Branch: {(s['dominant_branch'] or 'unknown').title()}")
+
+        if st.session_state.brain_pad:
+            st.checkbox("Use BrainPad as AI context", key="use_brainpad")
+
+        st.caption("☁️ Storage: Google Drive" if drive_enabled() else "💾 Storage: app server only")
+
+        st.divider()
+        st.caption(f"💡 {st.session_state.tip}")
+
+
+def main():
+    init_state()
+    sidebar()
+    show_flash()
+    PAGES[st.session_state.page]()
+
+
+main()
